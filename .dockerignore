@@ -1,0 +1,8 @@
+.git
+build
+out
+.cache
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+.env

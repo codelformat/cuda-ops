@@ -1,0 +1,34 @@
+# 构建产物
+build/
+out/
+*.o
+*.obj
+*.a
+*.so
+*.ptx
+*.cubin
+*.fatbin
+compile_commands.json
+
+# 性能分析报告（体积大，需要分享时单独存放）
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# 编辑器 / 工具缓存
+.vscode/
+.idea/
+.cache/
+*.swp
+.DS_Store
+
+# 本地环境变量（例如镜像源配置）
+.env

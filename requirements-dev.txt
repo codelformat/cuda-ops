@@ -1,0 +1,5 @@
+# 首次镜像构建成功后，用 `pip freeze` 把下列依赖锁定为 == 精确版本
+cmake>=3.28
+numpy
+pytest
+pre-commit

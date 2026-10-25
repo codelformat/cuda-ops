@@ -1,0 +1,9 @@
+# 在容器内执行一次 `pre-commit install` 启用；使用镜像里的 clang-format，保证版本一致
+repos:
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format
+        entry: clang-format -i
+        language: system
+        files: \.(c|cc|cpp|h|hpp|cu|cuh)$

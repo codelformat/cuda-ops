@@ -1,0 +1,21 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        USER_UID: ${HOST_UID:-1000}
+        USER_GID: ${HOST_GID:-1000}
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_MIRROR: ${PIP_MIRROR:-}
+    image: cuda-ops-dev:13.2.1
+    gpus: all
+    init: true
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    cap_add:
+      - SYS_PTRACE            # gdb / cuda-gdb
+    security_opt:
+      - seccomp=unconfined
+    command: sleep infinity
