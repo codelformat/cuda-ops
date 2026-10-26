@@ -27,7 +27,9 @@ RUN userdel -r ubuntu 2>/dev/null || true \
  && useradd -m -u ${USER_UID} -g ${USER_GID} -s /bin/bash ${USERNAME} \
  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
 
-# Python 工具链放在 venv 中（cmake 也从这里装，版本比 apt 新）
+# Python 工具链（含 torch）放在 venv 中
+# torch C++/CUDA 扩展只为 sm_86 编译，缩短编译时间
+ENV TORCH_CUDA_ARCH_LIST=8.6
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=${VIRTUAL_ENV}/bin:${PATH}
 COPY requirements-dev.txt /tmp/requirements-dev.txt
