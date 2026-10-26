@@ -1,7 +1,6 @@
-# 首次镜像构建成功后，用 `pip freeze` 把下列依赖锁定为 == 精确版本
 --extra-index-url https://download.pytorch.org/whl/cu132
 torch==2.14.1+cu132
-setuptools
-numpy
-pytest
-pre-commit
+setuptools==84.2.1
+numpy==2.5.4
+pytest==9.1.1
+pre-commit==4.7.0

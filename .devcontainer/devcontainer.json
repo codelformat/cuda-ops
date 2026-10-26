@@ -5,12 +5,25 @@
   "workspaceFolder": "/workspace",
   "remoteUser": "dev",
   "shutdownAction": "stopCompose",
+  "postCreateCommand": "pip install -e . --no-build-isolation",
   "customizations": {
     "vscode": {
       "extensions": [
         "ms-vscode.cpptools",
         "nvidia.nsight-vscode-edition"
-      ]
+      ],
+      "settings": {
+        "C_Cpp.default.compilerPath": "/usr/bin/g++",
+        "C_Cpp.default.cppStandard": "c++20",
+        "C_Cpp.default.includePath": [
+          "${workspaceFolder}/csrc",
+          "/opt/venv/lib/python3.12/site-packages/torch/include",
+          "/opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include",
+          "/usr/local/cuda/include",
+          "/usr/include/python3.12"
+        ],
+        "C_Cpp.default.defines": ["TORCH_EXTENSION_NAME=_C"]
+      }
     }
   }
 }

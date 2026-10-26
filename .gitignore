@@ -15,6 +15,7 @@ compile_commands.json
 *.nsys-rep
 *.qdrep
 *.sqlite
+reports/
 
 # Python
 __pycache__/
