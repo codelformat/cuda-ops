@@ -13,16 +13,18 @@ TOL = {
     torch.bfloat16: (1.6e-2, 1e-5),
 }
 
-# 覆盖：单元素、奇数长度、非向量宽度整数倍、常见 hidden size、单行超长
+# 覆盖：单元素、奇数长度、非向量宽度整数倍、常见 hidden size、跨分档边界、寄存器缓存上限、单行超长
 SHAPES = [
     (1, 1),
     (3, 7),
     (5, 127),
     (128, 768),
     (64, 1024),
+    (31, 1032),
     (33, 4096),
     (16, 5121),
     (4, 12288),
+    (3, 16384),
     (2, 65536),
 ]
 
@@ -47,6 +49,22 @@ def reference(x, w, b):
 @pytest.mark.parametrize("M,N", SHAPES)
 def test_forward(M, N, dtype):
     x, w, b = make_inputs(M, N, dtype)
+    y, mean, rstd = layer_norm_fwd(x, w, b, EPS)
+    y_ref, mean_ref, rstd_ref = reference(x, w, b)
+
+    rtol, atol = TOL[dtype]
+    torch.testing.assert_close(y, y_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(mean, mean_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(rstd, rstd_ref, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", list(TOL), ids=str)
+def test_misaligned_pointers(dtype):
+    # 首地址偏移一个元素：仍然连续，但不满足 16 字节对齐，应退回逐元素读写
+    M, N = 16, 1024
+    x = torch.randn(M * N + 1, device="cuda", dtype=dtype)[1:].view(M, N)
+    w = torch.randn(N + 1, device="cuda", dtype=dtype)[1:]
+    b = torch.randn(N + 1, device="cuda", dtype=dtype)[1:]
     y, mean, rstd = layer_norm_fwd(x, w, b, EPS)
     y_ref, mean_ref, rstd_ref = reference(x, w, b)
 

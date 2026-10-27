@@ -2,40 +2,54 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
+
+#include "common/vec.h"
 
 namespace cuda_ops {
 
     // __launch_bounds__ 告诉编译器 block 最多 kThreads 个线程，寄存器分配不会超过
     // 65536 / kThreads 个/线程，否则 kThreads=1024 时可能 "too many resources requested for launch"
-    template <typename T, int kThreads, int kSize>
+    template <typename T, int kThreads, int kSize, int kVec>
     __global__ void __launch_bounds__(kThreads) layer_norm_fwd_kernel(const T* __restrict__ x, const T* __restrict__ gamma,
                                         const T* __restrict__ beta, T* __restrict__ y,
                                         float* __restrict__ mean, float* __restrict__ rstd,
-                                        int64_t N, float eps) {
+                                        int64_t N, float eps) { 
+        static_assert(kSize % kVec == 0); // 一共 kSize 个寄存器，每次float4读或者AlignedVec读都要 kVec 个寄存器来存
         const int64_t row = blockIdx.x;
         const int64_t tid = threadIdx.x;
         // KThreads = 256个线程处理N个数
-        // 为了合并访存，每个线程负责处理tid, 共循环 N / KThreads 次
         __shared__ float warp_sum[kThreads / 32];
 
         float x_reg[kSize] = {0}; // 每个线程存下负责的（最多）kSize个x对应元素
 
         // 所有线程先搬运
         #pragma unroll
-        for (int k = 0; k < kSize; ++k) {
-            const int i = k * kThreads + threadIdx.x;
-            if (i < N) x_reg[k] = static_cast<float>(x[row * N + i]);
+        for (int k = 0; k < kSize / kVec; ++k) {
+
+            // 换成 128 位读
+            const int i = (k * kThreads + threadIdx.x) * kVec;
+            if (i < N) { // 启动 kernel 前已经保证了 N % kVec == 0，所以所有向量都是完整的
+                // 128 位读
+                const auto in = *reinterpret_cast<const AlignedVec<T, kVec>*>(x + row * N +i);
+                #pragma unroll
+                for (int j = 0; j < kVec; ++j) {
+                    // 存入寄存器
+                    x_reg[k * kVec + j] = static_cast<float>(in.v[j]);
+                }
+            }
         }
 
-        // TODO: 越界情况处理
         float sum = 0.0f;
         // 计算每个线程负责元素的sum
         #pragma unroll
-        for (int k = 0; k < kSize; ++k) {
-            const int i = k * kThreads + threadIdx.x;
-            if (i < N) sum += x_reg[k]; // 这里存在race，sum = sum + ... 都有先读sum的动作
+        for (int k = 0; k < kSize / kVec; ++k) {
+            #pragma unroll
+            for (int j = 0; j < kVec; ++j) {
+                sum += x_reg[k * kVec + j];
+            } // 求和可以省去判断，因为剩余元素都是 0 不影响结果
         }
         // 计算线程所属warp内的sum
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -54,9 +68,14 @@ namespace cuda_ops {
         // 计算每个线程负责的方差分子和
         float square_sum = 0.0f;
         #pragma unroll
-        for (int k = 0; k < kSize; ++k) {
-            const int i = k * kThreads + threadIdx.x;
-            if (i < N) square_sum += (x_reg[k] - row_mean) * (x_reg[k] - row_mean);
+        for (int k = 0; k < kSize / kVec; ++k) {
+            const int i = kVec * (k * kThreads + threadIdx.x);
+            if (i < N) {
+                #pragma unroll
+                for (int j = 0; j < kVec; ++j) {
+                    square_sum += (x_reg[k * kVec + j] - row_mean) * (x_reg[k * kVec + j] - row_mean);
+                }
+            }
         }
         // 计算每个warp的方差分子和
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -73,14 +92,23 @@ namespace cuda_ops {
         if (tid == 0) rstd[row] = row_rstd;
         
         // 写回
+        // 128 位写回，先组装成 kVec个元素然后一并写回
         #pragma unroll
-        for (int k = 0; k < kSize; ++k) {
-            const int i = k * kThreads + threadIdx.x;
-            // 这里x是fp16类型，最好显示转换类型
-            if (i < N) y[row * N + i] = static_cast<T>((x_reg[k] - row_mean) * row_rstd * gamma[i] + beta[i]);
+        for (int k = 0; k < kSize / kVec; ++k) {
+            const int i = kVec * (k * kThreads + threadIdx.x);
+            if (i < N) {
+                // 先按 128 位读gamma, beta
+                const auto in_gamma = *reinterpret_cast<const AlignedVec<T, kVec>*>(gamma + i);
+                const auto in_beta = *reinterpret_cast<const AlignedVec<T, kVec>*>(beta + i);
+                AlignedVec<T, kVec> out;
+                #pragma unroll
+                for (int j = 0; j < kVec; ++j){
+                    out.v[j] = static_cast<T>((x_reg[k * kVec + j] - row_mean) * row_rstd * static_cast<float>(in_gamma.v[j]) + static_cast<float>(in_beta.v[j]));
+                }
+                // 将 out 打包写回 y
+                *reinterpret_cast<AlignedVec<T, kVec>*>(y + row * N + i) = out;
+            }
         }
-        __syncthreads();
-
     }
 
     // 兜底 kernel（v1）：不缓存，x 从全局内存读三遍。寄存器放不下整行时（N > 16384）使用
@@ -132,24 +160,44 @@ namespace cuda_ops {
         }
     }
 
+    // 寄存器缓存整行（N <= 16384）。每线程缓存 kSize 个元素，按 kVec 个一组向量读写
+    template <typename T, int kVec>
+    void launch_cached(const T* x, const T* gamma, const T* beta, T* y, float* mean, float* rstd,
+                       int64_t M, int64_t N, float eps, cudaStream_t stream) {
+        const dim3 grid(static_cast<unsigned int>(M)); // 每行一个block处理
+        auto launch = [&](auto kernel, int threads) {
+            kernel<<<grid, threads, 0, stream>>>(x, gamma, beta, y, mean, rstd, N, eps);
+        };
+        // 小 N：每线程只处理 1 个向量，线程数取 N / kVec，避免大量线程空转
+        if (N <= 32 * kVec) launch(layer_norm_fwd_kernel<T, 32, kVec, kVec>, 32);
+        else if (N <= 64 * kVec) launch(layer_norm_fwd_kernel<T, 64, kVec, kVec>, 64);
+        else if (N <= 128 * kVec) launch(layer_norm_fwd_kernel<T, 128, kVec, kVec>, 128);
+        else if (N <= 256 * kVec) launch(layer_norm_fwd_kernel<T, 256, kVec, kVec>, 256);
+        // 之后 kSize = ceil(N / kThreads) 向上取到 2 的幂以控制模板实例数量，且至少为 kVec
+        // （kVec 较大时前几档走不到，实例与上面相同，不会多生成代码）。
+        // kSize 封顶 16，行再长就加线程而不是加寄存器：寄存器多了会降 occupancy，甚至溢出到 local memory
+        else if (N <= 512) launch(layer_norm_fwd_kernel<T, 256, std::max(kVec, 2), kVec>, 256);
+        else if (N <= 1024) launch(layer_norm_fwd_kernel<T, 256, std::max(kVec, 4), kVec>, 256);
+        else if (N <= 2048) launch(layer_norm_fwd_kernel<T, 256, std::max(kVec, 8), kVec>, 256);
+        else if (N <= 4096) launch(layer_norm_fwd_kernel<T, 256, 16, kVec>, 256);
+        else if (N <= 8192) launch(layer_norm_fwd_kernel<T, 512, 16, kVec>, 512);
+        else launch(layer_norm_fwd_kernel<T, 1024, 16, kVec>, 1024);
+    }
+
     // 对 x[M, N]的每一行： y = (x - mean) * rstd * gamma + beta
     // mean[M], rstd[M] 以 fp32 输出，供反向使用。 T 为 float / c10::Half / c10::BFloat16
     template <typename T>
     void launch_layer_norm_fwd(const T* x, const T* gamma, const T* beta, T* y, float* mean,
                             float* rstd, int64_t M, int64_t N, float eps, cudaStream_t stream) {
-        const dim3 grid(static_cast<unsigned int>(M)); // 每行一个block处理
-        auto launch = [&](auto kernel, int threads) {
-            kernel<<<grid, threads, 0, stream>>>(x, gamma, beta, y, mean, rstd, N, eps);
-        };
-        // 每线程缓存 kSize = ceil(N / kThreads) 个元素，向上取到 2 的幂以控制模板实例数量。
-        // kSize 封顶 16，行再长就加线程而不是加寄存器：寄存器多了会降 occupancy，甚至溢出到 local memory
-        if (N <= 256) launch(layer_norm_fwd_kernel<T, 256, 1>, 256);
-        else if (N <= 512) launch(layer_norm_fwd_kernel<T, 256, 2>, 256);
-        else if (N <= 1024) launch(layer_norm_fwd_kernel<T, 256, 4>, 256);
-        else if (N <= 2048) launch(layer_norm_fwd_kernel<T, 256, 8>, 256);
-        else if (N <= 4096) launch(layer_norm_fwd_kernel<T, 256, 16>, 256);
-        else if (N <= 8192) launch(layer_norm_fwd_kernel<T, 512, 16>, 512);
-        else if (N <= 16384) launch(layer_norm_fwd_kernel<T, 1024, 16>, 1024);
-        else launch(layer_norm_fwd_uncached_kernel<T, 256>, 256);
+        constexpr int kVec = 16 / sizeof(T); // 128 位一次读写的元素数：fp32 为 4，fp16/bf16 为 8
+        auto aligned = [](const void* p) { return reinterpret_cast<uintptr_t>(p) % 16 == 0; };
+        if (N > 16384) {
+            layer_norm_fwd_uncached_kernel<T, 256><<<static_cast<unsigned int>(M), 256, 0, stream>>>(
+                x, gamma, beta, y, mean, rstd, N, eps);
+        } else if (N % kVec == 0 && aligned(x) && aligned(gamma) && aligned(beta) && aligned(y)) {
+            launch_cached<T, kVec>(x, gamma, beta, y, mean, rstd, M, N, eps, stream);
+        } else { // 行首或指针不满足 16 字节对齐，退回逐元素读写
+            launch_cached<T, 1>(x, gamma, beta, y, mean, rstd, M, N, eps, stream);
+        }
     }
 }  // namespace cuda_ops
