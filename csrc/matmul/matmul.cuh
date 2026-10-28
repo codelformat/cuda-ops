@@ -29,6 +29,8 @@ namespace cuda_ops {
 
       __shared__ float A_TILE[BM][BK], B_TILE[BK][BN];
       float acc[TM][TN] = {0.0f}; // 每个线程只负责 TM * TN 个输出
+      float regM[TM] = {0.0f};
+      float regN[TN] = {0.0f}; // 负责将A_TILE, B_TILE计算时复用的寄存器
 
       for (int k = 0; k < K; k += BK) {
         // v1: 先搬运
@@ -56,11 +58,25 @@ namespace cuda_ops {
         // 开始计算
         #pragma unroll
         for (int kk = 0; kk < BK; ++ kk) {
+          // v2.0 直接使用共享内存计算，但多搬运了TM * TN - TM - TN 次 shared mem -> register
+          // #pragma unroll
+          // for (int i = 0; i < TM; ++ i) { // 该线程只负责 [ty*TM .. ty*TM+TM-1]
+          //   #pragma unroll
+          //   for (int j = 0; j < TN; ++ j) {
+          //     acc[i][j] += A_TILE[threadIdx.y * TM + i][kk] * B_TILE[kk][threadIdx.x * TN + j];
+          //   }
+          // }
+          
+          // v2.1 先搬运到寄存器，然后再计算
+          #pragma unroll 
+          for (int i = 0; i < TM; ++ i) regM[i] = A_TILE[threadIdx.y * TM + i][kk];
           #pragma unroll
-          for (int i = 0; i < TM; ++ i) { // 该线程只负责 [ty*TM .. ty*TM+TM-1]
+          for (int i = 0; i < TN; ++ i) regN[i] = B_TILE[kk][threadIdx.x * TN + i];
+          #pragma unroll
+          for (int i = 0; i < TM; ++ i) {
             #pragma unroll
             for (int j = 0; j < TN; ++ j) {
-              acc[i][j] += A_TILE[threadIdx.y * TM + i][kk] * B_TILE[kk][threadIdx.x * TN + j];
+              acc[i][j] += regM[i] * regN[j];
             }
           }
         }
