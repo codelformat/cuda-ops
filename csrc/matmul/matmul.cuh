@@ -9,69 +9,63 @@ namespace cuda_ops {
     template<typename T, int kThreads, int BM, int BN, int BK, int TM, int TN>
     __global__ void __launch_bounds__(kThreads) matmul_kernel(const T* a, const T* b, T* c, 
                                             int64_t M, int64_t N, int64_t K){ // 一个线程计算C的一个元素
-      // float sum = 0.0f;
+      // v1: matmul tiling 共享内存分块重写
+      // 计算 tid
+      const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-      // 先写直觉上的 x 对应行
-      // const int row = blockDim.x * blockIdx.x + threadIdx.x;
-      // const int col = blockDim.y * blockIdx.y + threadIdx.y;
+      // 将a, b, c先移动到该 block 负责小块的起始位置
+      a += blockIdx.y * BM * K;
+      b += blockIdx.x * BN;
+      c += blockIdx.y * BM * N + blockIdx.x * BN;
 
-      // 改成 x 对应列
-      // 
+      // 定义共享内存（ __shared__ 变量无法初始化），累加器，每次累加时的寄存器
+      __shared__ float ATILE[BM][BK], BTILE[BK][BN];
+      // 每个线程负责 TM * TN 个输出
+      float acc[TM][TN] = {0.0f};
+      float regM[TM] = {0.0f}; float regN[TN] = {0.0f};
 
-      const int tid = threadIdx.y * blockDim.x + threadIdx.x; // 该thread在block中的编码
-
-      // 先移动到a, b, c在该block的对应起始位置
-      a += BM * blockIdx.y * K;
-      b += BN * blockIdx.x;
-      c += BM * blockIdx.y * N + BN * blockIdx.x;
-
-      // if (row >= M || col >= N) return; // TODO: 不能直接return，会让__sync_threads()卡死，需要填0
-
-      __shared__ float A_TILE[BM][BK], B_TILE[BK][BN];
-      float acc[TM][TN] = {0.0f}; // 每个线程只负责 TM * TN 个输出
-      float regM[TM] = {0.0f};
-      float regN[TN] = {0.0f}; // 负责将A_TILE, B_TILE计算时复用的寄存器
-
-      for (int k = 0; k < K; k += BK) {
-        // v1: 先搬运
-        // 每个线程搬 BM * BK / KThreads 个 float 到 A_TILE
-        for(int i = 0; i < (BM * BK / kThreads); ++ i) {
+      // 开始循环。先搬运，再计算。在 K 维度上计算，以 BK 为步长
+      // 循环次数是编译期常量的，用 #pragma unroll 展开
+      for (int t = 0; t < K; t += BK) {
+        // 先搬 ATILE, 共 BM * BK 个元素。目的是让相邻线程尽可能地址相邻，合并访存
+        #pragma unroll
+        for (int i = 0; i < (BM * BK) / kThreads; ++ i) {
           int idx = tid + i * kThreads;
-          int r = idx / BK; // 一个线程只搬1个float，相邻线程自动合并访存
+          int r = idx / BK;
           int c = idx % BK;
-          if (blockIdx.y * BM + r >= M || k + c >= K) A_TILE[r][c] = 0.0f; // 越界填0
-          else A_TILE[r][c] = static_cast<float>(a[r * K + c + k]); // 只需要指定在当前block里的相对位置
+          // 需要加判断，如果越界访问则填 0
+          if (blockIdx.y * BM + r >= M || t + c >= K) ATILE[r][c] = 0;
+          else ATILE[r][c] = static_cast<float>(a[r * K + c + t]);
         }
 
-        for (int i = 0; i < (BK * BN / kThreads); ++ i) {
+        #pragma unroll
+        for (int i = 0; i < (BK * BN) / kThreads; ++ i) {
           int idx = tid + i * kThreads;
           int r = idx / BN;
           int c = idx % BN;
-          if (blockIdx.x * BN + c >= N || k + r >= K) B_TILE[r][c] = 0.0f; // 越界填0
-          else B_TILE[r][c] = static_cast<float>(b[(r + k) * N + c]); 
+          // 需要加判断，如果越界访问则填 0
+          if (t + r >= K || blockIdx.x * BN + c >= N) BTILE[r][c] = 0;
+          else BTILE[r][c] = static_cast<float>(b[(r + t) * N + c]);
         }
 
-        // 每个线程搬运的位置不一样，所以搬运时不需要同步
-        // 搬运后需要同步，防止后续计算访问到还没搬运进来的值
+        // 搬运完先同步，防止还没搬完其他线程就开始计算
         __syncthreads();
 
-        // 开始计算
+        // 开始计算。沿共同的 BK 维度累加
         #pragma unroll
         for (int kk = 0; kk < BK; ++ kk) {
-          // v2.0 直接使用共享内存计算，但多搬运了TM * TN - TM - TN 次 shared mem -> register
-          // #pragma unroll
-          // for (int i = 0; i < TM; ++ i) { // 该线程只负责 [ty*TM .. ty*TM+TM-1]
-          //   #pragma unroll
-          //   for (int j = 0; j < TN; ++ j) {
-          //     acc[i][j] += A_TILE[threadIdx.y * TM + i][kk] * B_TILE[kk][threadIdx.x * TN + j];
-          //   }
-          // }
-          
-          // v2.1 先搬运到寄存器，然后再计算
-          #pragma unroll 
-          for (int i = 0; i < TM; ++ i) regM[i] = A_TILE[threadIdx.y * TM + i][kk];
+          // 先把a小块对应的搬运到regM
+          // 每个线程负责的是 BM * BN 小块中的 [ty * TM ... ty * TM + TM - 1, tx * TN ... tx * TN + TN - 1]
           #pragma unroll
-          for (int i = 0; i < TN; ++ i) regN[i] = B_TILE[kk][threadIdx.x * TN + i];
+          for (int i = 0; i < TM; ++ i) {
+            regM[i] = ATILE[threadIdx.y * TM + i][kk];
+          }
+
+          #pragma unroll
+          for (int j = 0; j < TN; ++ j) {
+            regN[j] = BTILE[kk][threadIdx.x * TN + j];
+          }
+
           #pragma unroll
           for (int i = 0; i < TM; ++ i) {
             #pragma unroll
@@ -81,28 +75,24 @@ namespace cuda_ops {
           }
         }
 
-        // 防止有的线程算完了已经开始写下一轮TILE，结果有的warp还在计算，导致race
+        // 这里防止慢线程还在搬寄存器，快线程已经写入新值到共享内存了。
         __syncthreads();
-
-        // 如果 x 对应列，每轮只有b的col变，相邻32个线程可以访问连续地址的float，8个float4就能合并
-        // sum += static_cast<float>(a[row * K + k]) * static_cast<float>(b[k * N + col]); // 如果 x 对应行，相邻的线程在A上跨行读取，b不变，没法做合并访存
       }
 
-      // 写回c
-      // c[row * N + col] = static_cast<T>(sum);
-
-      // 搬运回C
-      // 先移动到线程起始位置
+      // 写回C
+      // 先计算 C 在当前线程的偏移
       c += threadIdx.y * TM * N + threadIdx.x * TN;
-      // 循环上界是模版常量，需要加#pragma unroll
+      // 每个线程只负责 c 的 TM * TN 个输出
       #pragma unroll
       for (int i = 0; i < TM; ++ i) {
         #pragma unroll
         for (int j = 0; j < TN; ++ j) {
+          // 写回这里也要加越界判断
           if (blockIdx.y * BM + threadIdx.y * TM + i < M && blockIdx.x * BN + threadIdx.x * TN + j < N)
             c[i * N + j] = static_cast<T>(acc[i][j]);
         }
       }
+
     }
 
     // C[M, N] = A[M, K] @ B[K, N]，均为行主序、连续存储，fp32 累加。T 为 float / c10::Half /
