@@ -1,18 +1,183 @@
 #pragma once
 
+#include <mma.h>
 #include <cuda_runtime.h>
+#include <type_traits>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cstdint>
 #include "common/vec.h"
 
 namespace cuda_ops {
 
+    // c10::Half / c10::BFloat16 与 __half / __nv_bfloat16 二进制相同，WMMA 只认后者
+    // 只为这两种类型特化，其他类型（如 float）误用时直接编译失败
+    template <typename T> struct WmmaType;
+    template <> struct WmmaType<c10::Half> { using type = __half; };
+    template <> struct WmmaType<c10::BFloat16> { using type = __nv_bfloat16; };
+
+    // V5: Tensor Core
+    template<typename T, int kThreads, int BM, int BN, int BK, int WM, int WN, int FM, int FN, int PAD>
+    __global__ void __launch_bounds__(kThreads) matmul_kernel_tc(const T* A, const T* B, T* C,
+                                    int64_t M, int64_t N, int64_t K) {
+      using namespace nvcuda;
+      using FragT = typename WmmaType<T>::type;
+      // fragment<用途， M, N, K, 元素类型， 布局>
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, FragT, wmma::row_major> a_frag[FM]; // A: 16 * 16
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, FragT, wmma::row_major> b_frag[FN]; // B: 16 * 16
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[FM][FN]; // C: 16 * 16, fp32, 不写布局
+      
+      // v5.2：先按线程并行搬运到共享内存，然后再按warp并行加载到fragment和计算
+      // __shared__ alignas(16) T ATILE[BK][BM + PAD], BTILE[BK][BN]; // 这里需要16字节对齐，同时为了防止STS.128带来的bank 冲突，ATILE转置并PAD
+      // 首先，load_matrix_sync要求32位对齐
+      // 其次，之前 v4 的ATILE转置是为了读到寄存器的 LDS.128能读到连续地址，而现在 load_matrix_sync使用的是 ldmatrix，能自己处理布局
+      __shared__ alignas(32) T ATILE[BM][BK + PAD], BTILE[BK][BN + PAD];
+
+      // 写回C的float缓冲
+      // 因为是整个 warp = 32线程协作，所以 每个只负责 256 / 32 = 8个float
+      // store_matrix_sync 要求目标地址 32 字节对齐；每个 warp 一块 16*16*4 = 1 KB，块首地址也都是 32 的倍数
+      __shared__ alignas(32) float tmpC[WM * WN][16][16];
+
+      // 先移动到要计算的位置
+      int warpId = (threadIdx.y * blockDim.x + threadIdx.x) / 32; // 0, 1, 2, 3
+      int warpM = warpId / WN; // 0, 1
+      int warpN = warpId % WN; // 0, 1
+      // 线程负责写回的位置
+      int tid = threadIdx.y * blockDim.x + threadIdx.x;
+      // 负责搬运：按线程在block里分工
+      constexpr int kACols = BK / 8; // 进入该算子的已经是 fp16 变量，一次float4读可以读8个数
+      const int aRow = tid / kACols; // 每个tid对应的在A小块中的初始行号
+      const int aCol = tid % kACols; // 每个tid对应的在A小块中的列号
+      constexpr int kARows = kThreads / kACols; // 每次循环所有线程可以搬ATILE多少行
+      constexpr int kALoads = BM / kARows; // 总共需要多少次循环可以搬运完A小块
+
+      constexpr int kBCols = BN / 8;
+      const int bRow = tid / kBCols;
+      const int bCol = tid % kBCols;
+      constexpr int kBRows = kThreads / kBCols;
+      constexpr int kBLoads = BK / kBRows;
+
+      int lane = tid % 32; // 线程在 warp 中的位置
+      // 负责写回：在warp里分工
+      // 256个float，32个线程，每个线程写8个，每次4个，共 16 * 16 / (32 * 4) = 2 次
+      // 一行 16 列由 4 个相邻线程负责，32 个线程一次覆盖 [8][16]，第 i 次写第 i * 8 + laneY 行
+      constexpr int kVec = 4;
+      constexpr int kLaneCols = 16 / kVec;         // 4
+      constexpr int kLaneRows = 32 / kLaneCols;    // 8
+      constexpr int kStores = 16 / kLaneRows;      // 2
+      int laneY = lane / kLaneCols;
+      int laneX = lane % kLaneCols;
+
+
+      // host 只保证 M、N 是 16 的倍数，不一定是 BM、BN 的倍数（如 M = 16 时第二行 warp 整个越界）
+      // 整个 warp 一起退出是安全的：32 个线程都不调用 _sync 函数，kernel 里也没有 __syncthreads
+      // if (blockIdx.y * BM + warpM * 16 >= M || blockIdx.x * BN + warpN * 16 >= N) {
+      //   // return; // v5.1: 使用了线程做搬运，越界的warp也有搬运任务，因此越界改为填 0
+      // }
+
+      // A += (blockIdx.y * BM + warpM * 16) * K; // 一个block里2个warpM负责一次t - t+BK的所有A中的[BM][BK]小块计算， BM是WM 2倍
+      // B += blockIdx.x * BN + warpN * 16; // 一个block里2个warpM负责一次t - t+BK的所有B中的[BK][BN]小块计算， BN是WN 2倍
+      // C += (blockIdx.y * BM + FM * warpM * 16) * N + blockIdx.x * BN + FN * warpN * 16; // v5.1 基址偏移重算
+
+      // v5.1 线程负责搬运
+      A += (blockIdx.y * BM) * K;
+      B += blockIdx.x * BN;
+      C += (blockIdx.y * BM + FM * warpM * 16) * N + blockIdx.x * BN + FN * warpN * 16; // v5.1 C按照每warp写入，转移到warp起始地址
+      #pragma unroll
+      for (int i = 0; i < FM; ++ i) 
+        #pragma unroll
+        for (int j = 0; j < FN; ++ j) 
+          wmma::fill_fragment(c_frag[i][j], 0.0f);
+ 
+      for(int t = 0; t < K; t += BK) { // 边界情况已经排除给v4 kernel处理
+        // v5.2 先按线程搬运到ATILE，BTILE
+        #pragma unroll
+        for (int i = 0; i < kALoads; ++ i) {
+          int r = aRow + i * kARows;
+          if (blockIdx.y * BM + r >= M || aCol * 8 + t >= K) {
+            AlignedVec<T, 8> emptyA; 
+            #pragma unroll
+            for (int j = 0; j < 8; ++ j) emptyA.v[j] = static_cast<T>(0.0f);
+            *reinterpret_cast<AlignedVec<T, 8>*>(&ATILE[r][aCol * 8]) = emptyA;
+          } else {
+            *reinterpret_cast<AlignedVec<T, 8>*>(&ATILE[r][aCol * 8]) = *reinterpret_cast<const AlignedVec<T, 8>*>(A + r * K + aCol * 8 + t);
+          }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < kBLoads; ++ i) {
+          int r = bRow + i * kBRows;
+          if (blockIdx.x * BN + bCol * 8 >= N || t + r >= K) {
+            AlignedVec<T, 8> emptyB; 
+            #pragma unroll 
+            for (int j = 0; j < 8; ++ j) emptyB.v[j] = static_cast<T>(0.0f);
+            *reinterpret_cast<AlignedVec<T, 8>*>(&BTILE[r][bCol * 8]) = emptyB;
+          } else {
+            *reinterpret_cast<AlignedVec<T, 8>*>(&BTILE[r][bCol * 8]) = *reinterpret_cast<const AlignedVec<T, 8>*>(B + (r + t) * N + bCol * 8);
+          }
+        }
+        // 搬运完做同步
+        __syncthreads();
+
+        // 针对ATILE, BTILE再做 Tensor Core计算
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk += 16) {
+          // wmma::load_matrix_sync(a_frag, reinterpret_cast<const FragT*>(A + t), K); // 从A指向的16*16小块左上角； lda: 一行有多少元素
+          // wmma::load_matrix_sync(b_frag, reinterpret_cast<const FragT*>(B + t * N), N);
+          // wmma::mma_sync(c_frag, a_frag, b_frag, c_frag); // c = a·b + c
+
+          // 这里和 v4_kernel 一样
+          #pragma unroll
+          for (int i = 0; i < FM; ++ i) wmma::load_matrix_sync(a_frag[i], reinterpret_cast<const FragT*>(&ATILE[warpM * FM * 16 + i * 16][kk]), BK + PAD);
+          #pragma unroll
+          for (int i = 0; i < FN; ++ i) wmma::load_matrix_sync(b_frag[i], reinterpret_cast<const FragT*>(&BTILE[kk][warpN * FN * 16 + i * 16]), BN + PAD);
+
+          #pragma unroll
+          for (int i = 0; i < FM; ++ i){
+            #pragma unroll
+            for (int j = 0; j < FN; ++ j){
+              wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+            }
+          }
+        }
+
+        __syncthreads();
+      }
+
+      // 写回
+      // 一个 warp 负责 64(FM*16) * 64(FN*16), 一个fragment是其中的16*16, 现在要一个个写回fragment(共循环FM*FN次)，要定位到block里fragment对应位置
+      #pragma unroll
+      for (int t = 0; t < (FM * FN); ++ t) {
+        // 判断是否在界内，因为M, N整除16，所以要么整个fragment全在界内要么全不在
+        if (blockIdx.y * BM + warpM * FM * 16 + (t / FN) * 16 >= M || blockIdx.x * BN + warpN * FN * 16 + (t % FN) * 16 >= N) continue;
+
+        // 必须先存进float缓冲，再转换成半精度写回C
+        // tmpC[warpId] 是 float[16][16]，退化后是 float(*)[16]，要用 &[0][0] 拿到 float*
+        wmma::store_matrix_sync(&tmpC[warpId][0][0], c_frag[t / FN][t % FN], 16, wmma::mem_row_major);
+        // warp 内同步：本 warp 32 个线程都写完 tmpC[warpId]，才能读别的线程写的位置
+        // 每个 warp 只读写自己那块，不需要 __syncthreads
+        __syncwarp();
+        // 每个线程读 4 个 float，逐个转换成 T，再整体写入 C（half 时为一条 8 字节的 STG.64）
+        #pragma unroll
+        for (int i = 0; i < kStores; ++ i) {
+          const int row = i * kLaneRows + laneY;
+          const int col = laneX * kVec;
+          const AlignedVec<float, kVec> src = *reinterpret_cast<const AlignedVec<float, kVec>*>(&tmpC[warpId][row][col]);
+          AlignedVec<T, kVec> dst;
+          #pragma unroll
+          for (int j = 0; j < kVec; ++ j) dst.v[j] = static_cast<T>(src.v[j]);
+          *reinterpret_cast<AlignedVec<T, kVec>*>(C + (row + (t / FN) * 16) * N + col + (t % FN) * 16) = dst;
+        }
+      }
+    }
+
     // 每个 block 计算 C 的 BM * BN 小块，每个线程计算其中 TM * TN 个元素，沿 K 每次处理 BK
     // __launch_bounds__ 第二个参数要求每个 SM 至少放 2 个 block，编译器会把寄存器限制在 128 以内
     // （v4 不加时 kVec=1 的版本为 130 个，每个 SM 只能放 1 个 block）
     template<typename T, int kThreads, int BM, int BN, int BK, int TM, int TN, int PAD, int kVec>
     __global__ void __launch_bounds__(kThreads, 2) matmul_kernel(const T* a, const T* b, T* c,
-                                            int64_t M, int64_t N, int64_t K){
+                                            int64_t M, int64_t N, int64_t K) {
       using Vec = AlignedVec<T, kVec>;
       using FloatVec = AlignedVec<float, kVec>;
       // 每个线程每个 tile 从 global 读 A、B 各几次，每次 kVec 个元素
@@ -171,29 +336,56 @@ namespace cuda_ops {
       //   static_cast<unsigned int>((N + BY - 1) / BY)
       // );
 
-      // v1: shared memory 分块
-      constexpr int BM = 128; constexpr int BN = 128;
-      constexpr int TM = 8; constexpr int TN = 8;
-      constexpr int BK = 8; // TODO: 根据情况具体定BK的值
-      constexpr int kThreads = (BM * BN) / (TM * TN);
+      auto v4_kernel = [&] {
+        // v1: shared memory 分块
+        constexpr int BM = 128; constexpr int BN = 128;
+        constexpr int TM = 8; constexpr int TN = 8;
+        constexpr int BK = 8; // TODO: 根据情况具体定BK的值
+        constexpr int kThreads = (BM * BN) / (TM * TN);
 
-      constexpr int PAD = 4;
+        constexpr int PAD = 4;
 
-      dim3 block(BN/ TN, BM / TM);
+        dim3 block(BN/ TN, BM / TM);
 
-      // 改成 x 对应列
-      const dim3 grid(
-        static_cast<unsigned int>((N + BN - 1) / BN),
-        static_cast<unsigned int>((M + BM - 1) / BM)
-      );
+        // 改成 x 对应列
+        const dim3 grid(
+          static_cast<unsigned int>((N + BN - 1) / BN),
+          static_cast<unsigned int>((M + BM - 1) / BM)
+        );
+        if ( K % 4 != 0 || N % 4 != 0
+          || reinterpret_cast<uintptr_t>(a) % sizeof(AlignedVec<T, 4>) != 0
+          || reinterpret_cast<uintptr_t>(b) % sizeof(AlignedVec<T, 4>) != 0)
+          matmul_kernel<T, kThreads, BM, BN, BK, TM, TN, PAD, 1><<<grid, block, 0, stream>>>(a, b, c, M, N, K);
+        else
+          matmul_kernel<T, kThreads, BM, BN, BK, TM, TN, PAD, 4><<<grid, block, 0, stream>>>(a, b, c, M, N, K);
+      };
 
-      if ( K % 4 != 0 || N % 4 != 0
-        || reinterpret_cast<uintptr_t>(a) % sizeof(AlignedVec<T, 4>) != 0
-        || reinterpret_cast<uintptr_t>(b) % sizeof(AlignedVec<T, 4>) != 0)
-        matmul_kernel<T, kThreads, BM, BN, BK, TM, TN, PAD, 1><<<grid, block, 0, stream>>>(a, b, c, M, N, K);
-      else
-        matmul_kernel<T, kThreads, BM, BN, BK, TM, TN, PAD, 4><<<grid, block, 0, stream>>>(a, b, c, M, N, K);
+      if constexpr (std::is_same_v<T, float>) { // fp32
+        v4_kernel();
+      } else { //fp16 / bf16; M, N, K 都是 16 倍数时走 Tensor Core
+        // load_matrix_sync 要求指针 32 字节对齐：K、N 是 16 的倍数时每行起点都是 32 字节的倍数，只需检查基地址
+        // c 来自 at::empty，至少 256 字节对齐，8 字节写入不需要检查
+        if ((M % 16 != 0) || (N % 16 != 0) || (K % 16 != 0)
+        || reinterpret_cast<uintptr_t>(a) % 32 != 0
+        || reinterpret_cast<uintptr_t>(b) % 32 != 0)
+          v4_kernel();
+        else {
+          // v5.2: BM=BN=128, BK=32
+          constexpr int BM = 128; constexpr int BN = 128; constexpr int BK = 32;
+          constexpr int WM = 2; constexpr int WN = 2;
+          constexpr int kThreads = 128;
+          constexpr int PAD = 8; // v5.1 预留
+          constexpr int FM = BM / WM / 16, FN = BN / WN / 16;
 
+
+          dim3 block(WN * 32, WM);
+          const dim3 grid (
+            static_cast<unsigned int>((N + BN - 1) / (BN)),
+            static_cast<unsigned int>((M + BM - 1) / (BM))
+          );
+
+          matmul_kernel_tc<T, kThreads, BM, BN, BK, WM, WN, FM, FN, PAD><<<grid, block, 0, stream>>>(a, b, c, M, N, K);
+        }
+      }
     }
-
 }  // namespace cuda_ops
