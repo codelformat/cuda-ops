@@ -2,6 +2,7 @@
 
 #include <mma.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -31,8 +32,9 @@ namespace cuda_ops {
       // v5.2：先按线程并行搬运到共享内存，然后再按warp并行加载到fragment和计算
       // __shared__ alignas(16) T ATILE[BK][BM + PAD], BTILE[BK][BN]; // 这里需要16字节对齐，同时为了防止STS.128带来的bank 冲突，ATILE转置并PAD
       // 首先，load_matrix_sync要求32位对齐
-      // 其次，之前 v4 的ATILE转置是为了读到寄存器的 LDS.128能读到连续地址，而现在 load_matrix_sync使用的是 ldmatrix，能自己处理布局
-      __shared__ alignas(32) T ATILE[BM][BK + PAD], BTILE[BK][BN + PAD];
+      // 其次，之前 v4 的ATILE转置是为了读到寄存器的 LDS.128能读到连续地址，而现在 load_matrix_sync使用的是 ldmatrix，能自己处理布局(每次8行，每行16字节，还是需要PAD处理冲突)
+      // v5.2: 双缓冲 cp.async
+      __shared__ alignas(32) T ATILE[2][BM][BK + PAD], BTILE[2][BK][BN + PAD];
 
       // 写回C的float缓冲
       // 因为是整个 warp = 32线程协作，所以 每个只负责 256 / 32 = 8个float
@@ -69,39 +71,22 @@ namespace cuda_ops {
       int laneY = lane / kLaneCols;
       int laneX = lane % kLaneCols;
 
-
-      // host 只保证 M、N 是 16 的倍数，不一定是 BM、BN 的倍数（如 M = 16 时第二行 warp 整个越界）
-      // 整个 warp 一起退出是安全的：32 个线程都不调用 _sync 函数，kernel 里也没有 __syncthreads
-      // if (blockIdx.y * BM + warpM * 16 >= M || blockIdx.x * BN + warpN * 16 >= N) {
-      //   // return; // v5.1: 使用了线程做搬运，越界的warp也有搬运任务，因此越界改为填 0
-      // }
-
-      // A += (blockIdx.y * BM + warpM * 16) * K; // 一个block里2个warpM负责一次t - t+BK的所有A中的[BM][BK]小块计算， BM是WM 2倍
-      // B += blockIdx.x * BN + warpN * 16; // 一个block里2个warpM负责一次t - t+BK的所有B中的[BK][BN]小块计算， BN是WN 2倍
-      // C += (blockIdx.y * BM + FM * warpM * 16) * N + blockIdx.x * BN + FN * warpN * 16; // v5.1 基址偏移重算
-
-      // v5.1 线程负责搬运
-      A += (blockIdx.y * BM) * K;
-      B += blockIdx.x * BN;
-      C += (blockIdx.y * BM + FM * warpM * 16) * N + blockIdx.x * BN + FN * warpN * 16; // v5.1 C按照每warp写入，转移到warp起始地址
-      #pragma unroll
-      for (int i = 0; i < FM; ++ i) 
-        #pragma unroll
-        for (int j = 0; j < FN; ++ j) 
-          wmma::fill_fragment(c_frag[i][j], 0.0f);
- 
-      for(int t = 0; t < K; t += BK) { // 边界情况已经排除给v4 kernel处理
-        // v5.2 先按线程搬运到ATILE，BTILE
+      // v5.2 预先定义好搬运函数
+      auto copy_tile = [&] (int buf, int t) {
+        // v5.1 先按线程搬运到ATILE，BTILE
+        // v5.2: 全面改用cp.async搬运并在最后提交，绕过寄存器中介
         #pragma unroll
         for (int i = 0; i < kALoads; ++ i) {
           int r = aRow + i * kARows;
-          if (blockIdx.y * BM + r >= M || aCol * 8 + t >= K) {
+          if (blockIdx.y * BM + r >= M || aCol * 8 + t >= K) { // v5.2 越界时不能用cp.async，只能普通写入 0，不变
             AlignedVec<T, 8> emptyA; 
             #pragma unroll
             for (int j = 0; j < 8; ++ j) emptyA.v[j] = static_cast<T>(0.0f);
-            *reinterpret_cast<AlignedVec<T, 8>*>(&ATILE[r][aCol * 8]) = emptyA;
+            *reinterpret_cast<AlignedVec<T, 8>*>(&ATILE[buf][r][aCol * 8]) = emptyA;
           } else {
-            *reinterpret_cast<AlignedVec<T, 8>*>(&ATILE[r][aCol * 8]) = *reinterpret_cast<const AlignedVec<T, 8>*>(A + r * K + aCol * 8 + t);
+            // *reinterpret_cast<AlignedVec<T, 8>*>(&ATILE[buf][r][aCol * 8]) = *reinterpret_cast<const AlignedVec<T, 8>*>(A + r * K + aCol * 8 + t);
+            // v5.2 改搬运逻辑
+            __pipeline_memcpy_async(&ATILE[buf][r][aCol * 8], A + r * K + aCol * 8 + t, 16); // 一次传16字节 
           }
         }
 
@@ -112,14 +97,18 @@ namespace cuda_ops {
             AlignedVec<T, 8> emptyB; 
             #pragma unroll 
             for (int j = 0; j < 8; ++ j) emptyB.v[j] = static_cast<T>(0.0f);
-            *reinterpret_cast<AlignedVec<T, 8>*>(&BTILE[r][bCol * 8]) = emptyB;
+            *reinterpret_cast<AlignedVec<T, 8>*>(&BTILE[buf][r][bCol * 8]) = emptyB;
           } else {
-            *reinterpret_cast<AlignedVec<T, 8>*>(&BTILE[r][bCol * 8]) = *reinterpret_cast<const AlignedVec<T, 8>*>(B + (r + t) * N + bCol * 8);
+            // *reinterpret_cast<AlignedVec<T, 8>*>(&BTILE[buf][r][bCol * 8]) = *reinterpret_cast<const AlignedVec<T, 8>*>(B + (r + t) * N + bCol * 8);
+            __pipeline_memcpy_async(&BTILE[buf][r][bCol * 8], B + (r + t) * N + bCol * 8, 16); // 一次传16字节
           }
         }
-        // 搬运完做同步
-        __syncthreads();
 
+        // 最后需要把之前发出的拷贝打包成一批 commit
+        __pipeline_commit();
+      };
+
+      auto compute_tile = [&] (int buf) {
         // 针对ATILE, BTILE再做 Tensor Core计算
         #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
@@ -129,9 +118,9 @@ namespace cuda_ops {
 
           // 这里和 v4_kernel 一样
           #pragma unroll
-          for (int i = 0; i < FM; ++ i) wmma::load_matrix_sync(a_frag[i], reinterpret_cast<const FragT*>(&ATILE[warpM * FM * 16 + i * 16][kk]), BK + PAD);
+          for (int i = 0; i < FM; ++ i) wmma::load_matrix_sync(a_frag[i], reinterpret_cast<const FragT*>(&ATILE[buf][warpM * FM * 16 + i * 16][kk]), BK + PAD);
           #pragma unroll
-          for (int i = 0; i < FN; ++ i) wmma::load_matrix_sync(b_frag[i], reinterpret_cast<const FragT*>(&BTILE[kk][warpN * FN * 16 + i * 16]), BN + PAD);
+          for (int i = 0; i < FN; ++ i) wmma::load_matrix_sync(b_frag[i], reinterpret_cast<const FragT*>(&BTILE[buf][kk][warpN * FN * 16 + i * 16]), BN + PAD);
 
           #pragma unroll
           for (int i = 0; i < FM; ++ i){
@@ -141,8 +130,34 @@ namespace cuda_ops {
             }
           }
         }
+      };
+      
+      // v5.1 线程负责搬运
+      A += (blockIdx.y * BM) * K;
+      B += blockIdx.x * BN;
+      C += (blockIdx.y * BM + FM * warpM * 16) * N + blockIdx.x * BN + FN * warpN * 16; // v5.1 C按照每warp写入，转移到warp起始地址
+      #pragma unroll
+      for (int i = 0; i < FM; ++ i) 
+        #pragma unroll
+        for (int j = 0; j < FN; ++ j) 
+          wmma::fill_fragment(c_frag[i][j], 0.0f);
 
-        __syncthreads();
+      int cur = 0;
+      // 先发出第0份tile的拷贝并commit
+      copy_tile(cur, 0);
+ 
+      for(int t = 0; t < K; t += BK) { // 边界情况已经排除给v4 kernel处理
+        // 等待上一轮（本线程）的 tile t搬运到齐了
+        __pipeline_wait_prior(0);
+        __syncthreads(); // 所有线程搬运到齐且上一轮计算全部结束
+        const bool has_next = t + BK < K;
+        if (has_next) {
+          copy_tile(cur ^ 1, t + BK); // 提前预取下一批 tile 
+        }
+        compute_tile(cur); // 异步用当前 tile 计算
+
+        // 搬运完做同步
+        cur ^= 1;
       }
 
       // 写回
