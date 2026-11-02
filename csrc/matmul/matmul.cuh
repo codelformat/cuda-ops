@@ -163,19 +163,16 @@ namespace cuda_ops {
         __pipeline_commit();
       };
 
-      auto compute_tile = [&] (int buf) {
+      auto compute_tile = [&] (int buf, bool has_next, int t) {
         // 针对ATILE, BTILE再做 Tensor Core计算
         #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
-          // wmma::load_matrix_sync(a_frag, reinterpret_cast<const FragT*>(A + t), K); // 从A指向的16*16小块左上角； lda: 一行有多少元素
-          // wmma::load_matrix_sync(b_frag, reinterpret_cast<const FragT*>(B + t * N), N);
-          // wmma::mma_sync(c_frag, a_frag, b_frag, c_frag); // c = a·b + c
-
-          // 这里和 v4_kernel 一样
-          // #pragma unroll
-          // for (int i = 0; i < FM; ++ i) wmma::load_matrix_sync(a_frag[i], reinterpret_cast<const FragT*>(&ATILE[buf][warpM * FM * 16 + i * 16][kk]), BK + PAD);
-          // #pragma unroll
-          // for (int i = 0; i < FN; ++ i) wmma::load_matrix_sync(b_frag[i], reinterpret_cast<const FragT*>(&BTILE[buf][kk][warpN * FN * 16 + i * 16]), BN + PAD);
+          // v5.5 先计算，再搬运，防止没有HMMA指令使 Tensor Core空转
+          // kk=0时Tensor Core还没运行，先直接进行计算;
+          // 接下来第二轮循环（kk == 16）有快的线程已经算完了，就先搬运下一块
+          // 这样快的线程搬运时慢的线程在计算上一个kk，慢线程算完后快线程已经搬运完自己的部分开始下一个kk的计算，Tensor Core不空转
+          // 省下了 kk = 0时, 所有线程一起拷贝下一块让tensor core空转的开销
+          if (kk == 16 & has_next) copy_tile(buf ^ 1, t + BK); 
 
           // v5.4 不再用wmma::load_matrix_sync, 直接使用 PTX 内联
           // 加载 FN 组 B(全部加载进来)
@@ -210,10 +207,8 @@ namespace cuda_ops {
         __pipeline_wait_prior(0);
         __syncthreads(); // 所有线程搬运到齐且上一轮计算全部结束
         const bool has_next = t + BK < K;
-        if (has_next) {
-          copy_tile(cur ^ 1, t + BK); // 提前预取下一批 tile 
-        }
-        compute_tile(cur); // 异步用当前 tile 计算
+        // v5.5 合并到compute_tile中
+        compute_tile(cur, has_next, t);
 
         // 搬运完做同步
         cur ^= 1;
