@@ -71,8 +71,31 @@ namespace cuda_ops {
       int laneY = lane / kLaneCols;
       int laneX = lane % kLaneCols;
 
+      // v5.3 M、N、K 都是 16 的倍数，内部 block 不可能越界。这个条件在 block 内取值相同，不会造成线程分歧
+      const bool block_inside = blockIdx.y * BM + BM <= M && blockIdx.x * BN + BN <= N;
+      // v5.3 预先算好每次搬运相对 A、B 小块起点的偏移，与 t 无关，每轮不用重算
+      int64_t aOff[kALoads], bOff[kBLoads];
+      #pragma unroll
+      for (int i = 0; i < kALoads; ++ i) aOff[i] = (aRow + i * kARows) * K + aCol * 8;
+      #pragma unroll
+      for (int i = 0; i < kBLoads; ++ i) bOff[i] = (bRow + i * kBRows) * N + bCol * 8;
+
       // v5.2 预先定义好搬运函数
       auto copy_tile = [&] (int buf, int t) {
+        // v5.3 快路径：整个 tile 都在界内时，不做逐线程越界判断，减少非 HMMA 指令和分支
+        if (block_inside && t + BK <= K) {
+          const T* aTile = A + t;
+          const T* bTile = B + t * N; // v5.3 这里的 t * N是64位乘法，每轮都要计算一遍
+          #pragma unroll
+          for (int i = 0; i < kALoads; ++ i)
+            __pipeline_memcpy_async(&ATILE[buf][aRow + i * kARows][aCol * 8], aTile + aOff[i], 16); // 每轮地址重算，且buf改变基址也要 IMAD 重算
+          #pragma unroll
+          for (int i = 0; i < kBLoads; ++ i)
+            __pipeline_memcpy_async(&BTILE[buf][bRow + i * kBRows][bCol * 8], bTile + bOff[i], 16);
+          __pipeline_commit();
+          return;
+        }
+
         // v5.1 先按线程搬运到ATILE，BTILE
         // v5.2: 全面改用cp.async搬运并在最后提交，绕过寄存器中介
         #pragma unroll
