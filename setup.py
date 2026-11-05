@@ -12,6 +12,9 @@ sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True) + glob.glob("csrc/**
 setup(
     name="cuda_ops",
     version="0.1.0",
+    description="Hand-written CUDA kernels (LayerNorm, SGEMM, Tensor Core GEMM) as a PyTorch extension",
+    author="Sheng Guan",
+    license="MIT",
     packages=["cuda_ops"],
     package_dir={"": "python"},
     ext_modules=[
@@ -22,7 +25,6 @@ setup(
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-lineinfo"],
-
             }
         )
     ],

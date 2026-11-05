@@ -172,7 +172,7 @@ namespace cuda_ops {
           // 接下来第二轮循环（kk == 16）有快的线程已经算完了，就先搬运下一块
           // 这样快的线程搬运时慢的线程在计算上一个kk，慢线程算完后快线程已经搬运完自己的部分开始下一个kk的计算，Tensor Core不空转
           // 省下了 kk = 0时, 所有线程一起拷贝下一块让tensor core空转的开销
-          if (kk == 16 & has_next) copy_tile(buf ^ 1, t + BK); 
+          if (kk == 16 && has_next) copy_tile(buf ^ 1, t + BK); 
 
           // v5.4 不再用wmma::load_matrix_sync, 直接使用 PTX 内联
           // 加载 FN 组 B(全部加载进来)
