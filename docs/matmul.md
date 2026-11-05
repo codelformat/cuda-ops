@@ -2,6 +2,7 @@
 
 `C[M, N] = A[M, K] @ B[K, N]`，行主序、连续存储，输入输出同为 fp32 / fp16 / bf16，内部 fp32 累加。
 代码：`csrc/matmul/matmul.cuh`；测试：`tests/test_matmul.py`；基准：`benchmarks/bench_matmul.py`。
+fp32 的优化见 v0 到 v4，fp16 / bf16 的 Tensor Core 版本见 v5，最新数据见“当前结果”。
 
 ## 硬件与测量方法
 
@@ -153,6 +154,8 @@ ncu（4096³ fp32）：
 
 指令数相近，差距在发射率（停顿）。
 
+2026-11-05 复测：v4 为 14,947,225 周期，cuBLAS 为 12,753,371 周期，按周期为 85.3%，锁频计时为 85.6%（见“当前结果”）。
+
 锁频 802 MHz（`tools/bench_locked.sh 800 python benchmarks/bench_matmul.py --dtype fp32 fp16`），占峰值比例：
 
 | shape | fp32 v4 / cuBLAS | 加速比 | fp16 v4 / cuBLAS（Tensor Core 峰值） | 加速比 |
@@ -167,6 +170,176 @@ ncu（4096³ fp32）：
 - fp16 cuBLAS 用 Tensor Core（`ampere_fp16_s1688gemm`），v4 仍是 CUDA core FFMA。
   注意 GeForce 上 ncu 的 `sm__pipe_tensor_cycles_active` 按 fp16 累加的速率计峰值，fp32 累加时 49.65% 已接近满载。
 
+## v5：Tensor Core（fp16 / bf16）
+
+fp16、bf16 输入在 M、N、K 都是 16 的倍数，且 `a`、`b` 首地址按 32 字节对齐时走 Tensor Core 版本 `matmul_kernel_tc`，
+否则退回 v4（`csrc/matmul/matmul.cuh` 的 host 分发）。fp32 始终走 v4。v5.2 起用到 `cp.async`，v5.4 起用到
+`ldmatrix` 和 `mma.sync.m16n8k16`，需要 Ampere（sm_80）及以后的 GPU。
+
+### 版本总览（4096³ fp16，ncu）
+
+各行取自当时保存的 ncu 报告（单次运行），相对速度以同期 cuBLAS 报告的 4,780,927 周期为基准。
+
+| 版本 | 主要改动 | 周期数 | 相对 cuBLAS | 寄存器 | shared memory | 指令数 |
+|---|---|---:|---:|---:|---:|---:|
+| v4 | fp16 输入，仍是 CUDA core FFMA | 15,217,344 | 31.4% | 123 | 16.6 KB | 26.5 亿 |
+| v5.0 | WMMA，fragment 直接从 global 读取 | 65,412,510 | 7.3% | 40 | 4.1 KB | 6.45 亿 |
+| v5.1 | A、B 先搬进 shared memory；PAD=8 | 5,714,743 | 83.7% | 230 | 23.0 KB | 1.17 亿 |
+| v5.2 | `cp.async` 双缓冲 | 5,677,438 | 84.2% | 210 | 42.0 KB | 1.52 亿 |
+| v5.3 | 界内 tile 走快路径，搬运偏移预先算好 | 5,369,694 | 89.0% | 242 | 42.0 KB | 9,456 万 |
+| v5.4（直接写回） | 手写 `ldmatrix` + `mma.sync`，寄存器直接写回 | 5,211,680 | 91.7% | 240 | 37.9 KB | 8,626 万 |
+| v5.4 | 写回先在 shared memory 拼成整 sector | 5,096,853 | 93.8% | 240 | 39.9 KB | 8,681 万 |
+| v5.5 | 下一块的拷贝移到 tile 中段 | 4,917,838 | 97.2% | 188 | 39.9 KB | 9,867 万 |
+| cuBLAS | `ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_stages_32x1_nn` | 4,780,927 | 100% | 234 | 32.8 KB | 9,884 万 |
+
+“v5.4（直接写回）”是开发过程中的中间状态，没有单独提交。v5.5 的三次平均见“当前结果”一节。
+
+主要停顿（每条发射指令平均等待的 warp 数，`smsp__average_warps_issue_stalled_*_per_issue_active.ratio`）：
+
+| 版本 | MIO Throttle | Long Scoreboard | LG Throttle | Math Pipe Throttle |
+|---|---:|---:|---:|---:|
+| v5.0 | 117.9 | 86.7 | 48.9 | 0.4 |
+| v5.1 | 0.48 | 4.97 | 0.00 | 10.4 |
+| v5.2 | 0.71 | 0.38 | 0.00 | 8.8 |
+| v5.3 | 1.38 | 0.60 | 0.71 | 14.4 |
+| v5.4 | 0.81 | 0.66 | 0.54 | 17.3 |
+| v5.5 | 0.16 | 0.27 | 0.13 | 13.6 |
+| cuBLAS | 0.07 | 0.05 | 0.00 | 13.7 |
+
+v5.1 之后的第一停顿都是 Math Pipe Throttle，即 Tensor Core 已经是瓶颈。warp 在等 Tensor Core 不等于 Tensor Core 空转：
+只有 SM 里所有 warp 都拿不出 HMMA 时，Tensor Core 才会闲下来。所以后面几版看的是 Tensor Core 利用率和周期数，
+而不是停顿比值。ncu 在 GeForce 上按 fp16 累加的速率计 `sm__pipe_tensor_cycles_active` 的峰值，fp32 累加时读数要乘以 2：
+v5.5 为 48.0%（约 96%），cuBLAS 为 49.6%（约 99%）。
+
+### v5.0：WMMA 直接读 global
+
+每个 warp 负责 C 的一个 16×16 小块，每步从 global 加载 A、B 各一个 16×16 fragment，warp 之间不共享数据。
+
+**手算对账**：每个 warp 每 16 个 k 读 2 × 256 × 2 B = 1 KB，共 (M/16)(N/16)(K/16) 步，合计 MNK/4 B ≈ 17.2 GB，
+即 5.37 亿个 sector；ncu 的 L2 读取为 5.28 亿个 sector（`lts__t_sectors_srcunit_tex_op_read.sum`）。DRAM 读 8.11 GB。
+
+**瓶颈**：MIO Throttle、Long Scoreboard、LG Throttle 三项都很高，Tensor Core 利用率只有 3.5%。
+换上更快的计算单元后，访存没有任何复用，比 v4 慢了 4.3 倍。
+
+### v5.1：shared memory 分块
+
+和 v1 的思路相同：block 负责 128×128，BK=32，4 个 warp 按 2×2 排列，每个 warp 负责 64×64（4×4 个 16×16 fragment）。
+A、B 先由全部线程搬进 shared memory，再由各 warp 用 `load_matrix_sync` 读取。
+
+**手算对账**：L2 读取量 = MNK × (1/BM + 1/BN) × 2 B = 2,147,483,648 B，即 6,711 万个 sector；ncu 为 6,672 万。
+
+**PAD**：WMMA 从 shared memory 读取时编译为 `LDSM`，每条按 8 行 × 16 B 为一组，8 行要落在不同的 bank，
+即行距必须是 16 B 的奇数倍。BK=32 时行距 64 B、BN=128 时行距 256 B，都是偶数倍；PAD=8 后变为 80 B 和 272 B。
+读方向的 bank conflict 降到 0，周期从 5.92M 降到 5.71M。
+
+### v5.2：cp.async 双缓冲
+
+`__pipeline_memcpy_async` 把数据从 global 直接拷进 shared memory，不经过寄存器（SASS 为 `LDGSTS`）。
+顺序为：等待本线程的拷贝完成 → `__syncthreads()` → 发出下一块的拷贝 → 计算当前块，每块一次同步。
+
+**结果**：寄存器 230 → 210，Long Scoreboard 4.97 → 0.38，但周期只少 0.6%：瓶颈已经是 Tensor Core，访存延迟本来就被遮住了。
+L2 读取量变为手算值的 1.5 倍（每条指令 24 个 sector，理想为 16），原因没有深究；改用 `.ca` 变体能恢复读取量，但反而略慢，所以保留默认写法。
+
+### v5.3：快路径
+
+整个 tile 都在矩阵范围内时（4096³ 时所有 tile 都是），跳过逐线程的越界判断；每次搬运的偏移在主循环外算好。
+每个 warp 每个 tile 的非 HMMA 指令从 226 条降到 116 条，周期减少 5.4%。
+
+### v5.4：手写 ldmatrix 与 mma.sync
+
+用内联 PTX 替换 WMMA：`ldmatrix.sync.aligned.m8n8.x4`（B 加 `.trans`）和 `mma.sync.aligned.m16n8k16.row.col.f32`。
+
+**线程映射**：加载一个 16×16 小块时，第 ℓ 号线程传入第 `ℓ % 16` 行、第 `(ℓ / 16) × 8` 列的地址；
+拿到的数据则是第 `ℓ / 4` 行（和第 `ℓ / 4 + 8` 行）、第 `(ℓ % 4) × 2` 列起的两个元素。线程传入的地址和它拿到的数据不是一回事。
+一条 m16n8k16 只算 8 列，16×16 的结果要两条指令。
+
+**结果**：
+- 不写回时周期减少 4.6%（不执行写回的对照版本：5.345M → 5.100M）。
+- A 的加载和计算交错与否，周期相同（5.215M 对 5.216M）；改用 k=8 的 `mma` 慢 4.6%。
+
+**写回**：寄存器里每个线程只有相邻 2 列，直接写 C 时一条指令每行只写 16 B，一个 32 B sector 要两次写请求：
+L2 写请求 230.4 万，理想值为 4096² × 2 B / 32 B = 104.9 万（`lts__t_requests_aperture_device_op_write.sum`），
+写回耗时约 11.5 万周期。先在 shared memory（每 warp 一块 16×16，共 2 KB）拼好，再每线程写 8 B，
+写请求降到 105.1 万，写回耗时约 1 万周期，周期 5.21M → 5.10M。
+
+### v5.5：拷贝移到 tile 中段
+
+v5.4 中 `__syncthreads()` 之后所有 warp 同时执行拷贝指令。把下一块的拷贝移到 `kk == 16` 之前：
+
+| 拷贝位置 | 周期 | Long Scoreboard |
+|---|---:|---:|
+| 同步之后、计算之前（v5.4） | 5.11M | 0.66 |
+| tile 中段（v5.5） | 4.93M | 0.27 |
+| tile 末尾 | 5.86M | 4.32 |
+
+放在末尾时拷贝没有时间被遮住，最慢；放在中段比放在开头快 3.5%。寄存器从 240 降到 188，指令数增加 13.7%，
+DRAM 读取从 624 MB 降到 354 MB，这三项变化的原因还没有查清。
+
+### 未解决：block 在 SM 间分配不均
+
+v5.5 在部分形状上比 v5.4 慢，例如 2048³（锁频计时 0.86× → 0.76×）。2048³ 只有 16 × 16 = 256 个 block，
+每个 SM 最多同时放 2 个，平均每个 SM 分到 256 / 58 ≈ 4.4 个，有的 SM 要多跑一到两个：
+
+| 2048³ | SM 活跃周期最小 | 最大 | 比值 |
+|---|---:|---:|---:|
+| v5.4 | 59.1 万 | 73.5 万 | 1.24（约 4 对 5 个 block） |
+| v5.5 | 55.1 万 | 82.6 万 | 1.50（约 4 对 6 个 block） |
+
+（`sm__cycles_active.min`、`sm__cycles_active.max`）单个 block 在 v5.5 更快，但最忙的 SM 多分到了 block。
+换成 block 数正好是 58 的整数倍的形状（3712×1024×2048，232 个 block），v5.5 比 v5.4 快 7.1%。
+每个 SM 实际分到几个 block 是由比值推算的，还需要在 kernel 里读取 `%smid` 直接统计。
+
+## 当前结果（2026-11-05 复测）
+
+**环境**：RTX 3080 Ti Laptop（sm_86，58 个 SM），驱动 595.99.02，CUDA 13.2（nvcc V13.2.78），cuBLAS 13.4.1，
+PyTorch 2.14.1+cu132，Nsight Compute 2026.1.1；`allow_tf32 = False`。环境信息可以用 `python tools/env_report.py` 输出。
+
+**4096³**：
+
+| dtype | 本仓库（周期） | cuBLAS（周期） | 按周期 | 锁频 802 MHz 计时 |
+|---|---:|---:|---:|---:|
+| fp32 | 14,947,225 | 12,753,371 | 85.3% | 85.6% |
+| fp16 | 4,932,261 | 4,782,600 | 97.0% | 96.9% |
+| bf16 | 4,927,563 | 4,771,878 | 96.8% | 96.9% |
+
+- 周期：ncu `sm__cycles_elapsed.max`，三次平均，与频率无关。cuBLAS 的 kernel：fp32 为 `cutlass_80_simt_sgemm_128x64_8x5_nn_align1`
+  （CUDA core，确认没有走 TF32），fp16 / bf16 为 `ampere_{fp16,bf16}_s1688gemm_*_128x128_ldg8_f2f_stages_32x1_nn`。
+- 计时：宿主机运行 `tools/bench_locked.sh 802 ...`，预热 3 次后取 9 次的中位数。两种口径相差不超过 0.3 个百分点。
+
+**其他形状（fp16，锁频计时，相对 cuBLAS）**：
+
+| 形状 M×N×K | 相对 cuBLAS | 形状 M×N×K | 相对 cuBLAS |
+|---|---:|---|---:|
+| 256³ | 0.50× | 4096×4096×256 | 1.11× |
+| 512³ | 0.56× | 1024×4096×1024 | 0.90× |
+| 1024³ | 0.79× | 4096×1024×1024 | 0.92× |
+| 2048³ | 0.76× | 1024×4096×4096 | 0.86× |
+| 4096³ | 0.97× | 4096×1024×4096 | 0.98× |
+| 4096×4096×1024 | 0.97× | 64×4096×4096 | 0.36× |
+| 256×4096×4096 | 0.66× | 4096×64×4096 | 0.35× |
+| 4096×256×4096 | 0.65× | | |
+
+小矩阵和 M 或 N 很小的形状 block 太少，填不满 SM；当前只有一种 tile 配置，下一步按形状选择。
+
+## 版本与提交对照
+
+| 版本 | 提交 | 提交说明 | 说明 |
+|---|---|---|---|
+| v0 | `38ffae9` | matmul v0 | 一致 |
+| v1（第一步） | `2b10068` | matmul v2: add tiling shared memory | 提交说明写作 v2，实际是 v1 的 shared memory 分块 |
+| v1（第二步） | `e55478a` | matmul v1.1 | 先把 shared memory 的数据读进寄存器，减少重复读取 |
+| v1 | `daab96c` | hand rewrite matmul v1 | 本文 v1 一节的数据 |
+| v2.1 到 v3 | `d4eb993` | matmul v3 | 包含转置、PAD、向量化和 `col_of` |
+| v4 | `a19e30d` | matmul v4 | 一致 |
+| v5.0 | 无 | | 没有单独提交 |
+| v5.1 | `745fb41` | v5.2: add shared memory | 提交说明写作 v5.2，实际是 v5.1 |
+| v5.2 | `0df982a` | v5.2: add cp.async | 一致 |
+| v5.3 | `5a7405e` | v5.3 | 一致 |
+| v5.4 | `cc63ebb` | v5.4 | 包含 shared memory 拼装写回 |
+| v5.5 | `10b2fdf` | v5.5 | 一致 |
+
+视频课程各节对应的 tag（`ep01` 起）见 README。
+
 ## 经验
 
 1. 先判断瓶颈在哪一类，再细分到具体单元：Speed Of Light → Pipe Utilization → Warp State → 逐条 SASS。
@@ -175,9 +348,14 @@ ncu（4096³ fp32）：
 4. 编译器会重排和合并访存（v1 整块读 A、v3 拆分 STS），以 SASS 为准。
 5. PAD 解决不同行之间的冲突，同一行内的冲突要改线程与数据的映射。
 6. LDG 不阻塞，用到结果时才等：预取的关键是把"用"推迟到计算之后。
+7. 瓶颈变成 Tensor Core 之后，warp 在等 Tensor Core 不代表它空转；判断收益看利用率和周期，不看停顿比值（v5.2）。
+8. 指令少了不一定更快，指令多了也不一定更慢（v5.5 多了 13.7% 的指令，周期少了 3.5%），以周期为准。
+9. 写回按 sector 计：一次写不满 32 B，L2 写请求就会翻倍（v5.4）。
+10. 单个 block 变快，总时间仍可能变长：block 数不是 SM 数的整数倍时，看最忙的 SM（v5.5）。
 
 ## 下一步
 
-- v5：Tensor Core（WMMA → `mma.sync` + `ldmatrix` + cp.async 多级流水），目标 fp16/bf16 达到 cuBLAS 的 80% 以上。
-- v6：小 M（split-K）。
+- 按形状选择 tile，让 block 在各 SM 上分得均匀，并用 `%smid` 验证。
+- 小 M 或小 N 的形状：split-K。
+- M、N、K 不是 16 的倍数时，补零到 16 的倍数后走 Tensor Core 版本，而不是退回 v4。
 - fp32 剩余空间：BK=16、寄存器双缓冲、float4 写回 C。
