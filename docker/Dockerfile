@@ -28,7 +28,7 @@ RUN userdel -r ubuntu 2>/dev/null || true \
  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
 
 # Python 工具链（含 torch）放在 venv 中
-# torch C++/CUDA 扩展只为 sm_86 编译，缩短编译时间
+# 这一行保持不变，以便复用已构建镜像的缓存；实际的编译目标由下方的 ARG 决定
 ENV TORCH_CUDA_ARCH_LIST=8.6
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=${VIRTUAL_ENV}/bin:${PATH}
@@ -36,6 +36,12 @@ COPY requirements-dev.txt /tmp/requirements-dev.txt
 RUN python3 -m venv ${VIRTUAL_ENV} \
  && pip install --no-cache-dir ${PIP_MIRROR:+-i ${PIP_MIRROR}} -r /tmp/requirements-dev.txt \
  && chown -R ${USER_UID}:${USER_GID} ${VIRTUAL_ENV}
+
+# 扩展的编译目标架构，默认 8.6（sm_86）。其他 GPU 在构建镜像时传入，例如：
+#   TORCH_CUDA_ARCH_LIST=8.9 docker compose build
+# 也可以不重建镜像，在编译扩展时临时指定，见 README
+ARG TORCH_CUDA_ARCH_LIST=8.6
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
 USER ${USERNAME}
 WORKDIR /workspace

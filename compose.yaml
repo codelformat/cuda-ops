@@ -8,6 +8,7 @@ services:
         USER_GID: ${HOST_GID:-1000}
         APT_MIRROR: ${APT_MIRROR:-}
         PIP_MIRROR: ${PIP_MIRROR:-}
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.6}
     image: cuda-ops-dev:13.2.1
     gpus: all
     init: true
